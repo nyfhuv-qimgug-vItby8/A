@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import threading
+import queue
+import time
+import json
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ENGINE_PATH = os.getenv("ENGINE_PATH")
+
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY is not set in .env")
+if not ENGINE_PATH or not os.path.exists(ENGINE_PATH):
+    raise ValueError("ENGINE_PATH is not set or does not exist in .env")
+
+class Shinden3Engine:
+    def __init__(self, engine_path, read_timeout=30):
+        self.proc = subprocess.Popen(
+            [engine_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        self._q = queue.Queue()
+        self._stop = threading.Event()
+        self._reader = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader.start()
+        self._read_timeout = read_timeout
+        self._send("usi")
+        self._wait_for("usiok", timeout=10)
+        self._send("isready")
+        self._wait_for("readyok", timeout=30)
+
+    def _reader_loop(self):
+        try:
+            while not self._stop.is_set():
+                line = self.proc.stdout.readline()
+                if line == "":
+                    break
+                self._q.put(line.rstrip("\n"))
+        except Exception:
+            pass
+
+    def _send(self, cmd):
+        if self.proc.stdin:
+            self.proc.stdin.write(cmd + "\n")
+            self.proc.stdin.flush()
+
+    def _wait_for(self, token, timeout=10):
+        start = time.time()
+        lines = []
+        while time.time() - start < timeout:
+            try:
+                line = self._q.get(timeout=0.1)
+                lines.append(line)
+                if line.strip() == token or token in line:
+                    return lines
+            except queue.Empty:
+                continue
+        raise TimeoutError(f"Timeout waiting for '{token}'")
+
+    def _collect_until(self, terminator="bestmove", timeout=30):
+        start = time.time()
+        lines = []
+        while time.time() - start < timeout:
+            try:
+                line = self._q.get(timeout=0.1)
+                lines.append(line)
+                if line.startswith(terminator):
+                    return lines
+            except queue.Empty:
+                continue
+        raise TimeoutError(f"Timeout waiting for '{terminator}'")
+
+    def analyze(self, position="startpos", depth=10, timeout=30):
+        self._send(f"position {position}")
+        self._send(f"go depth {depth}")
+        raw_lines = self._collect_until("bestmove", timeout=timeout)
+        infos = []
+        bestmove = None
+        for ln in raw_lines:
+            if ln.startswith("info"):
+                toks = ln.split()
+                info = {}
+                i = 1
+                while i < len(toks):
+                    t = toks[i]
+                    if t == "depth":
+                        info["depth"] = toks[i+1]; i += 2
+                    elif t == "score":
+                        typ = toks[i+1]
+                        val = toks[i+2]
+                        info["score"] = {typ: val}; i += 3
+                    elif t == "pv":
+                        info["pv"] = " ".join(toks[i+1:])
+                        break
+                    else:
+                        i += 1
+                infos.append(info)
+            elif ln.startswith("bestmove"):
+                parts = ln.split()
+                bestmove = parts[1] if len(parts) > 1 else None
+        return {"raw": raw_lines, "infos": infos, "bestmove": bestmove}
+
+    def quit(self):
+        try:
+            self._send("quit")
+        except Exception:
+            pass
+        self._stop.set()
+        if self._reader.is_alive():
+            self._reader.join(timeout=1)
+        try:
+            self.proc.terminate()
+        except Exception:
+            pass
+
+class GPTCommentator:
+    def __init__(self, api_key):
+        self.client = OpenAI(api_key=api_key)
+
+    def explain(self, analysis):
+        prompt = (
+            "以下は将棋エンジンの解析結果です。形勢、狙い筋、戦法の意図を初心者にも分かりやすく説明してください。\n\n"
+            + json.dumps(analysis, ensure_ascii=False, indent=2)
+        )
+        resp = self.client.chat.completions.create(
+            model="gpt-5",
+            messages=[
+                {"role":"system","content":"あなたは将棋のプロ解説者です。初心者にも分かりやすく説明してください。"},
+                {"role":"user","content":prompt}
+            ],
+            max_tokens=800
+        )
+        return resp.choices[0].message.content.strip()
+
+def main():
+    engine = None
+    try:
+        engine = Shinden3Engine(ENGINE_PATH)
+        gpt = GPTCommentator(OPENAI_API_KEY)
+        result = engine.analyze("startpos", depth=8, timeout=20)
+        print("=== Raw analysis ===")
+        print("\n".join(result["raw"]))
+        print("\n=== GPT 解説 ===")
+        comment = gpt.explain(result)
+        print(comment)
+    finally:
+        if engine:
+            engine.quit()
+
+if __name__ == "__main__":
+    main()
