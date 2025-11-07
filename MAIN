@@ -1,0 +1,116 @@
+"""
+Shinden3 × ChatGPT 将棋解説AI
+---------------------------------
+振電３エンジンで将棋局面を解析し、
+ChatGPT（GPT-5）がわかりやすく人間向けに解説します。
+"""
+
+import os
+import subprocess
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# ==============================
+# 初期設定
+# ==============================
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ENGINE_PATH = os.getenv("ENGINE_PATH")
+
+if not OPENAI_API_KEY:
+    raise ValueError("❌ OpenAI APIキーが設定されていません。'.env' に OPENAI_API_KEY を追加してください。")
+if not ENGINE_PATH or not os.path.exists(ENGINE_PATH):
+    raise ValueError("❌ 振電３エンジンが見つかりません。'.env' に ENGINE_PATH を正しく設定してください。")
+
+# ==============================
+# 振電３ エンジン操作クラス
+# ==============================
+class Shinden3Engine:
+    def __init__(self, engine_path):
+        self.engine = subprocess.Popen(
+            [engine_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
+        self._send("usi")
+        self._wait_ready()
+
+    def _send(self, cmd):
+        self.engine.stdin.write(cmd + "\n")
+        self.engine.stdin.flush()
+
+    def _wait_ready(self):
+        while True:
+            line = self.engine.stdout.readline().strip()
+            if line == "usiok":
+                break
+
+    def analyze(self, position="startpos", depth=10):
+        """局面を解析してUSI出力を返す"""
+        self._send(f"position {position}")
+        self._send(f"go depth {depth}")
+        lines = []
+        while True:
+            line = self.engine.stdout.readline().strip()
+            lines.append(line)
+            if line.startswith("bestmove"):
+                break
+        return "\n".join(lines)
+
+    def quit(self):
+        self._send("quit")
+
+# ==============================
+# ChatGPT 解説クラス
+# ==============================
+class GPTCommentator:
+    def __init__(self, api_key):
+        self.client = OpenAI(api_key=api_key)
+
+    def explain(self, analysis_text):
+        """AI出力を人間向けに自然文で解説"""
+        prompt = f"""
+以下は将棋AI「振電３」の解析出力です。
+これを人間にわかりやすく、形勢や狙い筋、戦法の意図を含めて説明してください。
+
+解析出力:
+{analysis_text}
+"""
+
+        response = self.client.chat.completions.create(
+            model="gpt-5",
+            messages=[
+                {"role": "system", "content": "あなたは将棋のプロ解説者です。初心者にも分かりやすく説明してください。"},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return response.choices[0].message.content.strip()
+
+# ==============================
+# メイン実行
+# ==============================
+def main():
+    print("🔹 振電３エンジンを起動中...")
+    engine = Shinden3Engine(ENGINE_PATH)
+    gpt = GPTCommentator(OPENAI_API_KEY)
+
+    print("🔹 局面を解析中...")
+    result = engine.analyze("startpos", depth=8)
+    print("✅ 解析完了。\n")
+
+    print("🔹 ChatGPTが解説を作成中...\n")
+    comment = gpt.explain(result)
+
+    print("🎯 === 解説 ===")
+    print(comment)
+
+    engine.quit()
+    print("\n🏁 終了しました。")
+
+# ==============================
+# エントリーポイント
+# ==============================
+if __name__ == "__main__":
+    main()
